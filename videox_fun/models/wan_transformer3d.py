@@ -22,7 +22,7 @@ from torch import nn
 from ..dist import (get_sequence_parallel_rank,
                     get_sequence_parallel_world_size, get_sp_group,
                     usp_attn_forward, xFuserLongContextAttention)
-from ..utils import cfg_skip
+from ..utils.cfg_optimization import cfg_skip
 from .attention_utils import attention
 from .cache_utils import TeaCache
 from .wan_camera_adapter import SimpleAdapter
@@ -170,6 +170,61 @@ def rope_apply_qk(q, k, grid_sizes, freqs):
     return q, k
 
 
+@amp.autocast(enabled=False)
+@torch.compiler.disable()
+def rope_apply_1d(x, seq_lens, freqs):
+    n = x.size(2)
+    output = []
+    for i, seq_len in enumerate(seq_lens.tolist()):
+        x_i = torch.view_as_complex(
+            x[i, :seq_len].to(torch.float32).reshape(seq_len, n, -1, 2))
+        freqs_i = freqs[:seq_len].view(seq_len, 1, -1)
+        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+        output.append(x_i)
+    return torch.stack(output).to(x.dtype)
+
+
+def rope_apply_qk_1d(q, k, seq_lens, freqs):
+    q = rope_apply_1d(q, seq_lens, freqs)
+    k = rope_apply_1d(k, seq_lens, freqs)
+    return q, k
+
+
+def build_branch_layer_pairing(num_layers, branch_layers, strategy="dilated", power=1.5):
+    if branch_layers < 0:
+        raise ValueError("branch_layers must be non-negative")
+    if branch_layers == 0:
+        return []
+    if branch_layers > num_layers:
+        raise ValueError(
+            f"branch_layers ({branch_layers}) must be <= num_layers ({num_layers})")
+    if branch_layers == 1:
+        return [0]
+
+    if strategy == "first":
+        raw = torch.arange(branch_layers, dtype=torch.float64)
+    elif strategy == "uniform":
+        raw = torch.linspace(0, num_layers - 1, branch_layers,
+                             dtype=torch.float64)
+    elif strategy == "dilated":
+        raw = torch.linspace(0, 1, branch_layers, dtype=torch.float64)
+        raw = raw.pow(power) * (num_layers - 1)
+    else:
+        raise ValueError(
+            f"Unsupported branch pairing strategy: {strategy}")
+
+    pairing = []
+    last = -1
+    for idx, value in enumerate(raw.round().long().tolist()):
+        min_value = last + 1
+        max_value = num_layers - (branch_layers - idx)
+        value = min(max(value, min_value), max_value)
+        pairing.append(value)
+        last = value
+    return pairing
+
+
 class WanRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-5):
@@ -227,6 +282,21 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+    def project_qkv(self, x, dtype=torch.bfloat16):
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        q = self.norm_q(self.q(x.to(dtype))).view(b, s, n, d)
+        k = self.norm_k(self.k(x.to(dtype))).view(b, s, n, d)
+        v = self.v(x.to(dtype)).view(b, s, n, d)
+        return q, k, v
+
+    def apply_rope(self, q, k, seq_lens, grid_sizes, freqs):
+        return rope_apply_qk(q, k, grid_sizes, freqs)
+
+    def project_output(self, x):
+        x = x.flatten(2)
+        x = self.o(x)
+        return x
+
     def forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16, t=0):
         r"""
         Args:
@@ -235,18 +305,8 @@ class WanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-
-        # query, key, value function
-        def qkv_fn(x):
-            q = self.norm_q(self.q(x.to(dtype))).view(b, s, n, d)
-            k = self.norm_k(self.k(x.to(dtype))).view(b, s, n, d)
-            v = self.v(x.to(dtype)).view(b, s, n, d)
-            return q, k, v
-
-        q, k, v = qkv_fn(x)
-
-        q, k = rope_apply_qk(q, k, grid_sizes, freqs)
+        q, k, v = self.project_qkv(x, dtype)
+        q, k = self.apply_rope(q, k, seq_lens, grid_sizes, freqs)
 
         x = attention(
             q.to(dtype), 
@@ -257,8 +317,7 @@ class WanSelfAttention(nn.Module):
         x = x.to(dtype)
 
         # output
-        x = x.flatten(2)
-        x = self.o(x)
+        x = self.project_output(x)
         return x
 
 
@@ -288,8 +347,29 @@ class WanT2VCrossAttention(WanSelfAttention):
         x = x.to(dtype)
 
         # output
-        x = x.flatten(2)
-        x = self.o(x)
+        x = self.project_output(x)
+        return x
+
+
+class WanSimulationSelfAttention(WanSelfAttention):
+
+    def apply_rope(self, q, k, seq_lens, grid_sizes, freqs):
+        return rope_apply_qk_1d(q, k, seq_lens, freqs)
+
+    def forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16, t=0):
+        q, k, v = self.project_qkv(x, dtype)
+        q, k = self.apply_rope(q, k, seq_lens, grid_sizes, freqs)
+
+        x = attention(
+            q.to(dtype),
+            k.to(dtype),
+            v=v.to(dtype),
+            q_lens=seq_lens,
+            k_lens=seq_lens,
+            window_size=self.window_size,
+        )
+        x = x.to(dtype)
+        x = self.project_output(x)
         return x
 
 
@@ -378,6 +458,15 @@ WAN_CROSSATTENTION_CLASSES = {
 }
 
 
+def _chunk_modulation(modulation, e):
+    if e.dim() > 3:
+        e = (modulation.unsqueeze(0) + e).chunk(6, dim=2)
+        e = [element.squeeze(2) for element in e]
+    else:
+        e = (modulation + e).chunk(6, dim=1)
+    return e
+
+
 class WanAttentionBlock(nn.Module):
 
     def __init__(self,
@@ -418,6 +507,27 @@ class WanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
+    def get_modulation(self, e):
+        return _chunk_modulation(self.modulation, e)
+
+    def self_attention(self, x, e, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16, t=0):
+        e = self.get_modulation(e)
+        temp_x = self.norm1(x) * (1 + e[1]) + e[0]
+        temp_x = temp_x.to(dtype)
+        y = self.self_attn(temp_x, seq_lens, grid_sizes, freqs, dtype, t=t)
+        x = x + y * e[2]
+        return x, e
+
+    def cross_attn_ffn(self, x, context, context_lens, e, dtype=torch.bfloat16, t=0):
+        x = x + self.cross_attn(self.norm3(x), context, context_lens, dtype, t=t)
+
+        temp_x = self.norm2(x) * (1 + e[4]) + e[3]
+        temp_x = temp_x.to(dtype)
+
+        y = self.ffn(temp_x)
+        x = x + y * e[5]
+        return x
+
     def forward(
         self,
         x,
@@ -438,33 +548,72 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        if e.dim() > 3:
-            e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
-            e = [e.squeeze(2) for e in e]
-        else:        
-            e = (self.modulation + e).chunk(6, dim=1)
+        x, e = self.self_attention(
+            x,
+            e,
+            seq_lens,
+            grid_sizes,
+            freqs,
+            dtype=dtype,
+            t=t,
+        )
+        x = self.cross_attn_ffn(
+            x,
+            context,
+            context_lens,
+            e,
+            dtype=dtype,
+            t=t,
+        )
+        return x
 
-        # self-attention
+
+class WanSimulationAttentionBlock(nn.Module):
+
+    def __init__(self,
+                 dim,
+                 ffn_dim,
+                 num_heads,
+                 qk_norm=True,
+                 eps=1e-6):
+        super().__init__()
+        self.dim = dim
+        self.ffn_dim = ffn_dim
+        self.num_heads = num_heads
+        self.qk_norm = qk_norm
+        self.eps = eps
+
+        self.norm1 = WanLayerNorm(dim, eps)
+        self.self_attn = WanSimulationSelfAttention(dim, num_heads, (-1, -1),
+                                                    qk_norm, eps)
+        self.norm2 = WanLayerNorm(dim, eps)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
+            nn.Linear(ffn_dim, dim))
+
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+
+    def get_modulation(self, e):
+        return _chunk_modulation(self.modulation, e)
+
+    def self_attention(self, x, e, seq_lens, freqs, dtype=torch.bfloat16, t=0):
+        e = self.get_modulation(e)
         temp_x = self.norm1(x) * (1 + e[1]) + e[0]
         temp_x = temp_x.to(dtype)
-
-        y = self.self_attn(temp_x, seq_lens, grid_sizes, freqs, dtype, t=t)
+        y = self.self_attn(temp_x, seq_lens, None, freqs, dtype, t=t)
         x = x + y * e[2]
+        return x, e
 
-        # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            # cross-attention
-            x = x + self.cross_attn(self.norm3(x), context, context_lens, dtype, t=t)
+    def ffn_only(self, x, e, dtype=torch.bfloat16):
+        temp_x = self.norm2(x) * (1 + e[4]) + e[3]
+        temp_x = temp_x.to(dtype)
+        y = self.ffn(temp_x)
+        x = x + y * e[5]
+        return x
 
-            # ffn function
-            temp_x = self.norm2(x) * (1 + e[4]) + e[3]
-            temp_x = temp_x.to(dtype)
-            
-            y = self.ffn(temp_x)
-            x = x + y * e[5]
-            return x
-
-        x = cross_attn_ffn(x, context, context_lens, e)
+    def forward(self, x, e, seq_lens, freqs, dtype=torch.bfloat16, t=0):
+        x, e = self.self_attention(x, e, seq_lens, freqs, dtype=dtype, t=t)
+        x = self.ffn_only(x, e, dtype=dtype)
         return x
 
 
@@ -498,6 +647,29 @@ class Head(nn.Module):
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
         
         x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
+        return x
+
+
+class SimulationHead(nn.Module):
+
+    def __init__(self, dim, out_dim, eps=1e-6):
+        super().__init__()
+        self.dim = dim
+        self.out_dim = out_dim
+        self.eps = eps
+
+        self.norm = WanLayerNorm(dim, eps)
+        self.head = nn.Linear(dim, out_dim)
+        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
+
+    def forward(self, x, e):
+        if e.dim() > 2:
+            e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
+            e = [element.squeeze(2) for element in e]
+        else:
+            e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
+
+        x = self.head(self.norm(x) * (1 + e[1]) + e[0])
         return x
 
 
@@ -554,6 +726,16 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         add_ref_conv=False,
         in_dim_ref_conv=16,
         cross_attn_type=None,
+        add_simulation_branch=False,
+        simulation_state_dim=6,
+        simulation_cond_dim=0,
+        simulation_out_dim=None,
+        simulation_num_layers=8,
+        simulation_pairing=None,
+        simulation_pairing_strategy="dilated",
+        simulation_pairing_power=1.5,
+        simulation_max_seq_len=4096,
+        simulation_separate_time_embedding=True,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -610,6 +792,14 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.add_simulation_branch = add_simulation_branch
+        self.simulation_state_dim = simulation_state_dim
+        self.simulation_cond_dim = simulation_cond_dim
+        self.simulation_num_layers = simulation_num_layers
+        self.simulation_pairing_strategy = simulation_pairing_strategy
+        self.simulation_pairing_power = simulation_pairing_power
+        self.simulation_max_seq_len = simulation_max_seq_len
+        self.simulation_separate_time_embedding = simulation_separate_time_embedding
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -653,7 +843,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
-        
+
         if add_control_adapter:
             self.control_adapter = SimpleAdapter(in_dim_control_adapter, dim, kernel_size=patch_size[1:], stride=patch_size[1:], downscale_factor=downscale_factor_control_adapter)
         else:
@@ -663,6 +853,74 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             self.ref_conv = nn.Conv2d(in_dim_ref_conv, dim, kernel_size=patch_size[1:], stride=patch_size[1:])
         else:
             self.ref_conv = None
+
+        self.simulation_input_embedding = None
+        self.simulation_time_embedding = None
+        self.simulation_time_projection = None
+        self.simulation_blocks = nn.ModuleList()
+        self.simulation_head = None
+        self.simulation_freqs = None
+        self.simulation_layer_mapping = {}
+
+        if add_simulation_branch:
+            if simulation_num_layers > num_layers:
+                raise ValueError(
+                    f"simulation_num_layers ({simulation_num_layers}) must be <= num_layers ({num_layers})")
+            self.simulation_out_dim = simulation_state_dim if simulation_out_dim is None else simulation_out_dim
+            self.simulation_input_dim = simulation_state_dim + simulation_cond_dim
+            self.simulation_input_embedding = nn.Sequential(
+                nn.LayerNorm(self.simulation_input_dim),
+                nn.Linear(self.simulation_input_dim, dim),
+                nn.GELU(approximate='tanh'),
+                nn.Linear(dim, dim),
+            )
+            if simulation_separate_time_embedding:
+                self.simulation_time_embedding = nn.Sequential(
+                    nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+                self.simulation_time_projection = nn.Sequential(
+                    nn.SiLU(), nn.Linear(dim, dim * 6))
+
+            self.simulation_blocks = nn.ModuleList([
+                WanSimulationAttentionBlock(dim, ffn_dim, num_heads, qk_norm,
+                                            eps)
+                for _ in range(simulation_num_layers)
+            ])
+            if simulation_pairing is None:
+                simulation_pairing = build_branch_layer_pairing(
+                    num_layers,
+                    simulation_num_layers,
+                    strategy=simulation_pairing_strategy,
+                    power=simulation_pairing_power,
+                )
+            else:
+                simulation_pairing = [int(layer_idx)
+                                      for layer_idx in simulation_pairing]
+                if len(simulation_pairing) != simulation_num_layers:
+                    raise ValueError(
+                        "simulation_pairing length must equal simulation_num_layers")
+                if sorted(simulation_pairing) != simulation_pairing:
+                    raise ValueError(
+                        "simulation_pairing must be sorted in ascending order")
+                if len(set(simulation_pairing)) != len(simulation_pairing):
+                    raise ValueError(
+                        "simulation_pairing must contain unique layer indices")
+                if simulation_pairing[0] < 0 or simulation_pairing[-1] >= num_layers:
+                    raise ValueError(
+                        "simulation_pairing values must be within [0, num_layers)")
+
+            self.simulation_pairing = simulation_pairing
+            self.simulation_layer_mapping = {
+                video_idx: sim_idx
+                for sim_idx, video_idx in enumerate(simulation_pairing)
+            }
+            self.simulation_head = SimulationHead(dim, self.simulation_out_dim,
+                                                  eps)
+            self.simulation_freqs = rope_params(
+                max(2, simulation_max_seq_len), d)
+        else:
+            self.simulation_out_dim = simulation_state_dim if simulation_out_dim is None else simulation_out_dim
+            self.simulation_input_dim = simulation_state_dim + simulation_cond_dim
+            self.simulation_pairing = []
 
         self.teacache = None
         self.cfg_skip_ratio = None
@@ -773,6 +1031,378 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 block.self_attn.forward = types.MethodType(
                     usp_attn_forward, block.self_attn)
 
+    def _ensure_simulation_freqs(self, seq_len, device):
+        if self.simulation_freqs is None:
+            return None
+        if self.simulation_freqs.device != device and torch.device(type="meta") != device:
+            self.simulation_freqs = self.simulation_freqs.to(device)
+        if seq_len > self.simulation_freqs.size(0):
+            self.simulation_freqs = rope_params(seq_len, self.d).to(device)
+        return self.simulation_freqs
+
+    def _concat_simulation_features(self, state, cond=None):
+        if state.size(-1) != self.simulation_state_dim:
+            raise ValueError(
+                f"Expected simulation state dim {self.simulation_state_dim}, got {state.size(-1)}")
+
+        if cond is None and self.simulation_cond_dim > 0:
+            cond = state.new_zeros(*state.shape[:-1], self.simulation_cond_dim)
+
+        if cond is not None:
+            if cond.size(-1) != self.simulation_cond_dim:
+                raise ValueError(
+                    f"Expected simulation cond dim {self.simulation_cond_dim}, got {cond.size(-1)}")
+            state = torch.cat([state, cond], dim=-1)
+
+        if state.size(-1) != self.simulation_input_dim:
+            raise ValueError(
+                f"Expected simulation input dim {self.simulation_input_dim}, got {state.size(-1)}")
+        return state
+
+    def _prepare_simulation_inputs(self, simulation_states, simulation_cond=None):
+        if self.simulation_input_embedding is None:
+            raise ValueError("Simulation branch is not initialized")
+
+        simulation_is_tensor = isinstance(simulation_states, torch.Tensor)
+        simulation_was_squeezed = False
+
+        if simulation_is_tensor:
+            if simulation_states.dim() == 3:
+                simulation_states = simulation_states.unsqueeze(0)
+                simulation_was_squeezed = True
+            if simulation_states.dim() != 4:
+                raise ValueError(
+                    "simulation_states must have shape [B, T, N, C] or [T, N, C]")
+
+            if simulation_cond is not None:
+                if not isinstance(simulation_cond, torch.Tensor):
+                    raise ValueError(
+                        "simulation_cond must match the container type of simulation_states")
+                if simulation_cond.dim() == 3:
+                    simulation_cond = simulation_cond.unsqueeze(0)
+                if simulation_cond.shape[:-1] != simulation_states.shape[:-1]:
+                    raise ValueError(
+                        "simulation_cond must match simulation_states on [B, T, N]")
+
+            simulation_inputs = self._concat_simulation_features(
+                simulation_states, simulation_cond)
+            batch_size, steps, num_points, _ = simulation_inputs.shape
+            simulation_hidden = self.simulation_input_embedding(
+                simulation_inputs).reshape(batch_size, steps * num_points,
+                                           self.dim)
+            simulation_seq_lens = torch.full(
+                (batch_size,),
+                steps * num_points,
+                dtype=torch.long,
+                device=simulation_hidden.device,
+            )
+            simulation_shapes = [(int(steps), int(num_points))] * batch_size
+            return (
+                simulation_hidden,
+                simulation_seq_lens,
+                simulation_shapes,
+                simulation_is_tensor,
+                simulation_was_squeezed,
+            )
+
+        if not isinstance(simulation_states, (list, tuple)):
+            raise ValueError(
+                "simulation_states must be a tensor or a list/tuple of tensors")
+
+        if simulation_cond is not None and not isinstance(simulation_cond,
+                                                          (list, tuple)):
+            raise ValueError(
+                "simulation_cond must be a tensor when simulation_states is a tensor, or a list/tuple otherwise")
+
+        simulation_hidden = []
+        simulation_seq_lens = []
+        simulation_shapes = []
+
+        for idx, state in enumerate(simulation_states):
+            if state.dim() != 3:
+                raise ValueError(
+                    "Each simulation state tensor must have shape [T, N, C]")
+            cond = None if simulation_cond is None else simulation_cond[idx]
+            if cond is not None and cond.shape[:-1] != state.shape[:-1]:
+                raise ValueError(
+                    "Each simulation_cond tensor must match the corresponding simulation_states tensor on [T, N]")
+
+            state = self._concat_simulation_features(state, cond)
+            steps, num_points, _ = state.shape
+            hidden = self.simulation_input_embedding(state).reshape(-1,
+                                                                    self.dim)
+            simulation_hidden.append(hidden)
+            simulation_seq_lens.append(hidden.size(0))
+            simulation_shapes.append((int(steps), int(num_points)))
+
+        max_simulation_seq_len = max(simulation_seq_lens)
+        simulation_hidden = torch.stack([
+            torch.cat([
+                hidden,
+                hidden.new_zeros(max_simulation_seq_len - hidden.size(0),
+                                 hidden.size(1))
+            ],
+                      dim=0) for hidden in simulation_hidden
+        ])
+        simulation_seq_lens = torch.tensor(
+            simulation_seq_lens,
+            dtype=torch.long,
+            device=simulation_hidden.device,
+        )
+        return (
+            simulation_hidden,
+            simulation_seq_lens,
+            simulation_shapes,
+            simulation_is_tensor,
+            simulation_was_squeezed,
+        )
+
+    def _build_simulation_time_embeddings(self, t, simulation_t=None):
+        if simulation_t is None:
+            simulation_t = t if t.dim() == 1 else t[:, -1]
+        elif simulation_t.dim() != 1:
+            simulation_t = simulation_t[:, -1]
+
+        time_embedding = self.time_embedding
+        time_projection = self.time_projection
+        if self.simulation_time_embedding is not None:
+            time_embedding = self.simulation_time_embedding
+            time_projection = self.simulation_time_projection
+
+        with amp.autocast(dtype=torch.float32):
+            simulation_e = time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, simulation_t).float())
+            simulation_e0 = time_projection(simulation_e).unflatten(
+                1, (6, self.dim))
+
+        return simulation_e, simulation_e0
+
+    def _joint_attention(self, video_attn, simulation_attn, video_x,
+                         simulation_x, seq_lens, simulation_seq_lens,
+                         grid_sizes, simulation_freqs, dtype):
+        video_q, video_k, video_v = video_attn.project_qkv(video_x, dtype)
+        simulation_q, simulation_k, simulation_v = simulation_attn.project_qkv(
+            simulation_x, dtype)
+
+        video_q, video_k = video_attn.apply_rope(video_q, video_k, seq_lens,
+                                                 grid_sizes, self.freqs)
+        simulation_q, simulation_k = simulation_attn.apply_rope(
+            simulation_q, simulation_k, simulation_seq_lens, None,
+            simulation_freqs)
+
+        joint_q = torch.cat([video_q, simulation_q], dim=1)
+        joint_k = torch.cat([video_k, simulation_k], dim=1)
+        joint_v = torch.cat([video_v, simulation_v], dim=1)
+        joint_seq_lens = seq_lens.to(joint_q.device) + simulation_seq_lens.to(
+            joint_q.device)
+
+        joint_hidden = attention(
+            joint_q.to(dtype),
+            joint_k.to(dtype),
+            joint_v.to(dtype),
+            q_lens=joint_seq_lens,
+            k_lens=joint_seq_lens,
+            window_size=(-1, -1),
+        )
+        joint_hidden = joint_hidden.to(dtype)
+
+        video_hidden = joint_hidden[:, :video_x.size(1)]
+        simulation_hidden = joint_hidden[:, video_x.size(1):]
+
+        video_hidden = video_attn.project_output(video_hidden)
+        simulation_hidden = simulation_attn.project_output(simulation_hidden)
+        return video_hidden, simulation_hidden
+
+    def _forward_joint_branch_block(
+        self,
+        block,
+        simulation_block,
+        x,
+        simulation_hidden,
+        e0,
+        simulation_e0,
+        seq_lens,
+        simulation_seq_lens,
+        grid_sizes,
+        context,
+        context_lens,
+        simulation_freqs,
+        dtype=torch.bfloat16,
+        t=0,
+    ):
+        video_e = block.get_modulation(e0)
+        simulation_e = simulation_block.get_modulation(simulation_e0)
+
+        video_input = block.norm1(x) * (1 + video_e[1]) + video_e[0]
+        simulation_input = simulation_block.norm1(simulation_hidden) * (
+            1 + simulation_e[1]) + simulation_e[0]
+
+        video_input = video_input.to(dtype)
+        simulation_input = simulation_input.to(dtype)
+
+        video_y, simulation_y = self._joint_attention(
+            block.self_attn,
+            simulation_block.self_attn,
+            video_input,
+            simulation_input,
+            seq_lens,
+            simulation_seq_lens,
+            grid_sizes,
+            simulation_freqs,
+            dtype,
+        )
+
+        x = x + video_y * video_e[2]
+        simulation_hidden = simulation_hidden + simulation_y * simulation_e[2]
+
+        x = block.cross_attn_ffn(
+            x,
+            context,
+            context_lens,
+            video_e,
+            dtype=dtype,
+            t=t,
+        )
+        simulation_hidden = simulation_block.ffn_only(
+            simulation_hidden, simulation_e, dtype=dtype)
+        return x, simulation_hidden
+
+    def _forward_transformer_blocks(
+        self,
+        x,
+        e0,
+        seq_lens,
+        grid_sizes,
+        context,
+        context_lens,
+        dtype,
+        t,
+        simulation_hidden=None,
+        simulation_e0=None,
+        simulation_seq_lens=None,
+        simulation_freqs=None,
+    ):
+        use_simulation_branch = simulation_hidden is not None
+        block_kwargs = dict(
+            e=e0,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            freqs=self.freqs,
+            context=context,
+            context_lens=context_lens,
+            dtype=dtype,
+            t=t,
+        )
+
+        for layer_idx, block in enumerate(self.blocks):
+            simulation_idx = self.simulation_layer_mapping.get(
+                layer_idx) if use_simulation_branch else None
+
+            if simulation_idx is None:
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs)
+
+                        return custom_forward
+
+                    ckpt_kwargs: Dict[str, Any] = {
+                        "use_reentrant": False
+                    } if is_torch_version(">=", "1.11.0") else {}
+                    x = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        x,
+                        e0,
+                        seq_lens,
+                        grid_sizes,
+                        self.freqs,
+                        context,
+                        context_lens,
+                        dtype,
+                        t,
+                        **ckpt_kwargs,
+                    )
+                else:
+                    x = block(x, **block_kwargs)
+                continue
+
+            simulation_block = self.simulation_blocks[simulation_idx]
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+
+                def create_joint_forward(video_block, branch_block,
+                                         **static_kwargs):
+                    def custom_forward(video_x, branch_x, video_e, branch_e):
+                        return self._forward_joint_branch_block(
+                            video_block,
+                            branch_block,
+                            video_x,
+                            branch_x,
+                            video_e,
+                            branch_e,
+                            **static_kwargs,
+                        )
+
+                    return custom_forward
+
+                ckpt_kwargs: Dict[str, Any] = {
+                    "use_reentrant": False
+                } if is_torch_version(">=", "1.11.0") else {}
+                x, simulation_hidden = torch.utils.checkpoint.checkpoint(
+                    create_joint_forward(
+                        block,
+                        simulation_block,
+                        seq_lens=seq_lens,
+                        simulation_seq_lens=simulation_seq_lens,
+                        grid_sizes=grid_sizes,
+                        context=context,
+                        context_lens=context_lens,
+                        simulation_freqs=simulation_freqs,
+                        dtype=dtype,
+                        t=t,
+                    ),
+                    x,
+                    simulation_hidden,
+                    e0,
+                    simulation_e0,
+                    **ckpt_kwargs,
+                )
+            else:
+                x, simulation_hidden = self._forward_joint_branch_block(
+                    block,
+                    simulation_block,
+                    x,
+                    simulation_hidden,
+                    e0,
+                    simulation_e0,
+                    seq_lens,
+                    simulation_seq_lens,
+                    grid_sizes,
+                    context,
+                    context_lens,
+                    simulation_freqs,
+                    dtype=dtype,
+                    t=t,
+                )
+
+        return x, simulation_hidden
+
+    def _unpack_simulation_tokens(self, simulation_hidden, simulation_shapes,
+                                  simulation_is_tensor,
+                                  simulation_was_squeezed):
+        outputs = []
+        for hidden, (steps, num_points) in zip(simulation_hidden,
+                                               simulation_shapes):
+            outputs.append(hidden[:steps * num_points].view(
+                steps, num_points, -1))
+
+        if simulation_is_tensor:
+            outputs = torch.stack(outputs)
+            if simulation_was_squeezed:
+                outputs = outputs[0]
+            return outputs
+        return outputs
+
     @cfg_skip()
     def forward(
         self,
@@ -786,6 +1416,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         full_ref=None,
         subject_ref=None,
         cond_flag=True,
+        simulation_states=None,
+        simulation_cond=None,
+        simulation_t=None,
+        return_simulation=False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -805,19 +1439,40 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 Conditional video inputs for image-to-video mode, same shape as x
             cond_flag (`bool`, *optional*, defaults to True):
                 Flag to indicate whether to forward the condition input
+            simulation_states (Tensor or List[Tensor], *optional*):
+                Noisy simulation states with shape [B, T, N, C_state] or per-sample [T, N, C_state]
+            simulation_cond (Tensor or List[Tensor], *optional*):
+                Per-point simulation conditions concatenated with `simulation_states`
+            simulation_t (Tensor, *optional*):
+                Optional diffusion timestep override for the simulation branch
+            return_simulation (`bool`, *optional*, defaults to False):
+                If True, also return the denoised simulation states
 
         Returns:
-            List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+            Tensor or Tuple[Tensor, Tensor/List[Tensor]]:
+                Denoised video latents, and optionally denoised simulation states
         """
         # Wan2.2 don't need a clip.
         # if self.model_type == 'i2v':
         #     assert clip_fea is not None and y is not None
         # params
         device = self.patch_embedding.weight.device
-        dtype = x.dtype
+        if isinstance(x, torch.Tensor):
+            dtype = x.dtype
+        elif len(x) > 0:
+            dtype = x[0].dtype
+        else:
+            raise ValueError("x must be a tensor or a non-empty list of tensors")
         if self.freqs.device != device and torch.device(type="meta") != device:
             self.freqs = self.freqs.to(device)
+
+        use_simulation_branch = simulation_states is not None
+        if use_simulation_branch and not self.add_simulation_branch:
+            raise ValueError(
+                "simulation_states were provided but add_simulation_branch is disabled in the model config")
+        if use_simulation_branch and self.sp_world_size > 1:
+            raise NotImplementedError(
+                "Simulation branch does not yet support sequence-parallel inference")
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -865,6 +1520,37 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                       dim=1) for u in x
         ])
 
+        simulation_hidden = None
+        simulation_e = None
+        simulation_e0 = None
+        simulation_seq_lens = None
+        simulation_shapes = None
+        simulation_is_tensor = False
+        simulation_was_squeezed = False
+        simulation_freqs = None
+
+        if use_simulation_branch:
+            (
+                simulation_hidden,
+                simulation_seq_lens,
+                simulation_shapes,
+                simulation_is_tensor,
+                simulation_was_squeezed,
+            ) = self._prepare_simulation_inputs(
+                simulation_states, simulation_cond)
+
+            if simulation_hidden.size(0) != x.size(0):
+                if x.size(0) % simulation_hidden.size(0) != 0:
+                    raise ValueError(
+                        "simulation_states batch size must either match x batch size or divide it exactly")
+                repeat_factor = x.size(0) // simulation_hidden.size(0)
+                simulation_hidden = torch.cat(
+                    [simulation_hidden] * repeat_factor, dim=0)
+                simulation_seq_lens = simulation_seq_lens.repeat(
+                    repeat_factor)
+                simulation_shapes = simulation_shapes * repeat_factor
+                simulation_was_squeezed = False
+
         # time embeddings
         with amp.autocast(dtype=torch.float32):
             if t.dim() != 1:
@@ -888,6 +1574,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             # e0 = e0.to(dtype)
             # e = e.to(dtype)
 
+        if use_simulation_branch:
+            simulation_e, simulation_e0 = self._build_simulation_time_embeddings(
+                t, simulation_t)
+            simulation_freqs = self._ensure_simulation_freqs(
+                int(simulation_seq_lens.max().item()), simulation_hidden.device)
+
         # context
         context_lens = None
         context = self.text_embedding(
@@ -907,9 +1599,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             if t.dim() != 1:
                 e0 = torch.chunk(e0, self.sp_world_size, dim=1)[self.sp_world_rank]
                 e = torch.chunk(e, self.sp_world_size, dim=1)[self.sp_world_rank]
-        
+
+        use_teacache = self.teacache is not None and not use_simulation_branch
+
         # TeaCache
-        if self.teacache is not None:
+        if use_teacache:
             if cond_flag:
                 if t.dim() != 1:
                     modulated_inp = e0[:, -1, :]
@@ -934,89 +1628,46 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 self.should_calc = self.teacache.should_calc
         
         # TeaCache
-        if self.teacache is not None:
+        if use_teacache:
             if not self.should_calc:
                 previous_residual = self.teacache.previous_residual_cond if cond_flag else self.teacache.previous_residual_uncond
                 x = x + previous_residual.to(x.device)[-x.size()[0]:,]
             else:
                 ori_x = x.clone().cpu() if self.teacache.offload else x.clone()
-
-                for block in self.blocks:
-                    if torch.is_grad_enabled() and self.gradient_checkpointing:
-
-                        def create_custom_forward(module):
-                            def custom_forward(*inputs):
-                                return module(*inputs)
-
-                            return custom_forward
-                        ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                        x = torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(block),
-                            x,
-                            e0,
-                            seq_lens,
-                            grid_sizes,
-                            self.freqs,
-                            context,
-                            context_lens,
-                            dtype,
-                            t,
-                            **ckpt_kwargs,
-                        )
-                    else:
-                        # arguments
-                        kwargs = dict(
-                            e=e0,
-                            seq_lens=seq_lens,
-                            grid_sizes=grid_sizes,
-                            freqs=self.freqs,
-                            context=context,
-                            context_lens=context_lens,
-                            dtype=dtype,
-                            t=t  
-                        )
-                        x = block(x, **kwargs)
+                x, simulation_hidden = self._forward_transformer_blocks(
+                    x,
+                    e0,
+                    seq_lens,
+                    grid_sizes,
+                    context,
+                    context_lens,
+                    dtype,
+                    t,
+                    simulation_hidden=simulation_hidden,
+                    simulation_e0=simulation_e0,
+                    simulation_seq_lens=simulation_seq_lens,
+                    simulation_freqs=simulation_freqs,
+                )
                     
                 if cond_flag:
                     self.teacache.previous_residual_cond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
                 else:
                     self.teacache.previous_residual_uncond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
         else:
-            for block in self.blocks:
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-
-                    def create_custom_forward(module):
-                        def custom_forward(*inputs):
-                            return module(*inputs)
-
-                        return custom_forward
-                    ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                    x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
-                        x,
-                        e0,
-                        seq_lens,
-                        grid_sizes,
-                        self.freqs,
-                        context,
-                        context_lens,
-                        dtype,
-                        t,
-                        **ckpt_kwargs,
-                    )
-                else:
-                    # arguments
-                    kwargs = dict(
-                        e=e0,
-                        seq_lens=seq_lens,
-                        grid_sizes=grid_sizes,
-                        freqs=self.freqs,
-                        context=context,
-                        context_lens=context_lens,
-                        dtype=dtype,
-                        t=t  
-                    )
-                    x = block(x, **kwargs)
+            x, simulation_hidden = self._forward_transformer_blocks(
+                x,
+                e0,
+                seq_lens,
+                grid_sizes,
+                context,
+                context_lens,
+                dtype,
+                t,
+                simulation_hidden=simulation_hidden,
+                simulation_e0=simulation_e0,
+                simulation_seq_lens=simulation_seq_lens,
+                simulation_freqs=simulation_freqs,
+            )
 
         # head
         if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -1029,6 +1680,34 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             x = torch.utils.checkpoint.checkpoint(create_custom_forward(self.head), x, e, **ckpt_kwargs)
         else:
             x = self.head(x, e)
+
+        simulation_output = None
+        if use_simulation_branch:
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+
+                    return custom_forward
+
+                ckpt_kwargs: Dict[str, Any] = {
+                    "use_reentrant": False
+                } if is_torch_version(">=", "1.11.0") else {}
+                simulation_hidden = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(self.simulation_head),
+                    simulation_hidden,
+                    simulation_e,
+                    **ckpt_kwargs,
+                )
+            else:
+                simulation_hidden = self.simulation_head(
+                    simulation_hidden, simulation_e)
+            simulation_output = self._unpack_simulation_tokens(
+                simulation_hidden,
+                simulation_shapes,
+                simulation_is_tensor,
+                simulation_was_squeezed,
+            )
 
         if self.sp_world_size > 1:
             x = self.all_gather(x, dim=1)
@@ -1046,10 +1725,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
         x = torch.stack(x)
-        if self.teacache is not None and cond_flag:
+        if use_teacache and cond_flag:
             self.teacache.cnt += 1
             if self.teacache.cnt == self.teacache.num_steps:
                 self.teacache.reset()
+        if return_simulation:
+            return x, simulation_output
         return x
 
 
@@ -1098,9 +1779,15 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         for m in self.time_embedding.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=.02)
+        if self.simulation_time_embedding is not None:
+            for m in self.simulation_time_embedding.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, std=.02)
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
+        if self.simulation_head is not None:
+            nn.init.zeros_(self.simulation_head.head.weight)
 
     @classmethod
     def from_pretrained(
@@ -1329,6 +2016,16 @@ class Wan2_2Transformer3DModel(WanTransformer3DModel):
         downscale_factor_control_adapter=8,
         add_ref_conv=False,
         in_dim_ref_conv=16,
+        add_simulation_branch=False,
+        simulation_state_dim=6,
+        simulation_cond_dim=0,
+        simulation_out_dim=None,
+        simulation_num_layers=8,
+        simulation_pairing=None,
+        simulation_pairing_strategy="dilated",
+        simulation_pairing_power=1.5,
+        simulation_max_seq_len=4096,
+        simulation_separate_time_embedding=True,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -1387,7 +2084,17 @@ class Wan2_2Transformer3DModel(WanTransformer3DModel):
             downscale_factor_control_adapter=downscale_factor_control_adapter,
             add_ref_conv=add_ref_conv,
             in_dim_ref_conv=in_dim_ref_conv,
-            cross_attn_type="cross_attn"
+            cross_attn_type="cross_attn",
+            add_simulation_branch=add_simulation_branch,
+            simulation_state_dim=simulation_state_dim,
+            simulation_cond_dim=simulation_cond_dim,
+            simulation_out_dim=simulation_out_dim,
+            simulation_num_layers=simulation_num_layers,
+            simulation_pairing=simulation_pairing,
+            simulation_pairing_strategy=simulation_pairing_strategy,
+            simulation_pairing_power=simulation_pairing_power,
+            simulation_max_seq_len=simulation_max_seq_len,
+            simulation_separate_time_embedding=simulation_separate_time_embedding,
         )
         
         if hasattr(self, "img_emb"):

@@ -1,4 +1,6 @@
+import importlib
 import importlib.util
+import warnings
 
 from diffusers import AutoencoderKL
 from transformers import (AutoProcessor, AutoTokenizer, CLIPImageProcessor,
@@ -19,39 +21,61 @@ except Exception:
     Qwen2VLProcessor, Qwen2_5_VLConfig = None, None
     print("Your transformers version is too old to load Qwen2_5_VLForConditionalGeneration and Qwen2Tokenizer. If you wish to use QwenImage, please upgrade your transformers package to the latest version.")
 
-from .cogvideox_transformer3d import CogVideoXTransformer3DModel
-from .cogvideox_vae import AutoencoderKLCogVideoX
-from .fantasytalking_audio_encoder import FantasyTalkingAudioEncoder
-from .fantasytalking_transformer3d import FantasyTalkingTransformer3DModel
-from .flux2_image_processor import Flux2ImageProcessor
-from .flux2_transformer2d import Flux2Transformer2DModel
-from .flux2_transformer2d_control import Flux2ControlTransformer2DModel
-from .flux2_vae import AutoencoderKLFlux2
-from .flux_transformer2d import FluxTransformer2DModel
-from .hunyuanvideo_transformer3d import HunyuanVideoTransformer3DModel
-from .hunyuanvideo_vae import AutoencoderKLHunyuanVideo
-from .longcatvideo_audio_encoder import Wav2Vec2ModelWrapper
-from .longcatvideo_transformer3d import LongCatVideoTransformer3DModel
-from .longcatvideo_transformer3d_avatar import \
-    LongCatVideoAvatarTransformer3DModel
-from .longcatvideo_vae import AutoencoderKLLongCatVideo
-from .qwenimage_transformer2d import QwenImageTransformer2DModel
-from .qwenimage_transformer2d_control import QwenImageControlTransformer2DModel
-from .qwenimage_transformer2d_instantx import QwenImageInstantXControlNetModel
-from .qwenimage_vae import AutoencoderKLQwenImage
-from .turbowan_transformer3d import TurboWanTransformer3DModel
-from .wan_audio_encoder import WanAudioEncoder
-from .wan_image_encoder import CLIPModel
-from .wan_text_encoder import WanT5EncoderModel
+def _optional_import(module_name, *names):
+    try:
+        module = importlib.import_module(f".{module_name}", __name__)
+    except Exception as exc:
+        for name in names:
+            globals()[name] = None
+        warnings.warn(
+            f"Optional model module '{module_name}' is unavailable: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+
+    for name in names:
+        globals()[name] = getattr(module, name)
+
+
+_optional_import("cogvideox_transformer3d", "CogVideoXTransformer3DModel")
+_optional_import("cogvideox_vae", "AutoencoderKLCogVideoX")
+_optional_import("fantasytalking_audio_encoder", "FantasyTalkingAudioEncoder")
+_optional_import("fantasytalking_transformer3d", "FantasyTalkingTransformer3DModel")
+_optional_import("flux2_image_processor", "Flux2ImageProcessor")
+_optional_import("flux2_transformer2d", "Flux2Transformer2DModel")
+_optional_import("flux2_transformer2d_control", "Flux2ControlTransformer2DModel")
+_optional_import("flux2_vae", "AutoencoderKLFlux2")
+_optional_import("flux_transformer2d", "FluxTransformer2DModel")
+_optional_import("hunyuanvideo_transformer3d", "HunyuanVideoTransformer3DModel")
+_optional_import("hunyuanvideo_vae", "AutoencoderKLHunyuanVideo")
+_optional_import("longcatvideo_audio_encoder", "Wav2Vec2ModelWrapper")
+_optional_import("longcatvideo_transformer3d", "LongCatVideoTransformer3DModel")
+_optional_import(
+    "longcatvideo_transformer3d_avatar", "LongCatVideoAvatarTransformer3DModel"
+)
+_optional_import("longcatvideo_vae", "AutoencoderKLLongCatVideo")
+_optional_import("qwenimage_transformer2d", "QwenImageTransformer2DModel")
+_optional_import(
+    "qwenimage_transformer2d_control", "QwenImageControlTransformer2DModel"
+)
+_optional_import(
+    "qwenimage_transformer2d_instantx", "QwenImageInstantXControlNetModel"
+)
+_optional_import("qwenimage_vae", "AutoencoderKLQwenImage")
+_optional_import("turbowan_transformer3d", "TurboWanTransformer3DModel")
+_optional_import("wan_audio_encoder", "WanAudioEncoder")
+_optional_import("wan_image_encoder", "CLIPModel")
+_optional_import("wan_text_encoder", "WanT5EncoderModel")
 from .wan_transformer3d import (Wan2_2Transformer3DModel, WanRMSNorm,
                                 WanSelfAttention, WanTransformer3DModel)
-from .wan_transformer3d_animate import Wan2_2Transformer3DModel_Animate
-from .wan_transformer3d_s2v import Wan2_2Transformer3DModel_S2V
-from .wan_transformer3d_vace import VaceWanTransformer3DModel
-from .wan_vae import AutoencoderKLWan, AutoencoderKLWan_
-from .wan_vae3_8 import AutoencoderKLWan2_2_, AutoencoderKLWan3_8
-from .z_image_transformer2d import ZImageTransformer2DModel
-from .z_image_transformer2d_control import ZImageControlTransformer2DModel
+_optional_import("wan_transformer3d_animate", "Wan2_2Transformer3DModel_Animate")
+_optional_import("wan_transformer3d_s2v", "Wan2_2Transformer3DModel_S2V")
+_optional_import("wan_transformer3d_vace", "VaceWanTransformer3DModel")
+_optional_import("wan_vae", "AutoencoderKLWan", "AutoencoderKLWan_")
+_optional_import("wan_vae3_8", "AutoencoderKLWan2_2_", "AutoencoderKLWan3_8")
+_optional_import("z_image_transformer2d", "ZImageTransformer2DModel")
+_optional_import("z_image_transformer2d_control", "ZImageControlTransformer2DModel")
 
 # The pai_fuser is an internally developed acceleration package, which can be used on PAI.
 if importlib.util.find_spec("paifuser") is not None:

@@ -4,6 +4,28 @@ import numpy as np
 import torch
 
 
+def _concat_cfg_outputs(first, second):
+    if isinstance(first, torch.Tensor) and isinstance(second, torch.Tensor):
+        return torch.cat([first, second], dim=0)
+    if isinstance(first, np.ndarray) and isinstance(second, np.ndarray):
+        return np.concatenate([first, second], axis=0)
+    if isinstance(first, tuple) and isinstance(second, tuple):
+        if len(first) != len(second):
+            raise ValueError("cfg_skip received tuple outputs with mismatched lengths")
+        return tuple(
+            _concat_cfg_outputs(first_item, second_item)
+            for first_item, second_item in zip(first, second)
+        )
+    if isinstance(first, list) and isinstance(second, list):
+        return first + second
+    if first is None and second is None:
+        return None
+    raise TypeError(
+        f"cfg_skip does not know how to concatenate outputs of type "
+        f"{type(first).__name__} and {type(second).__name__}"
+    )
+
+
 def cfg_skip():
     def decorator(func):
         def wrapper(self, *args, **kwargs):
@@ -86,12 +108,12 @@ def cfg_skip():
                 uncond_out = func(self, *uncond_args_i,
                                     **uncond_kwargs_i)
 
-                result = torch.cat([uncond_out, cond_out], dim=0)
+                result = _concat_cfg_outputs(uncond_out, cond_out)
             else:
                 result = func(self, *new_args, **new_kwargs)
 
             if bs >= 2 and self.cfg_skip_ratio is not None and self.current_steps >= self.num_inference_steps * (1 - self.cfg_skip_ratio):
-                result = torch.cat([result, result], dim=0)
+                result = _concat_cfg_outputs(result, result)
 
             return result
         return wrapper
