@@ -611,27 +611,12 @@ class WanSimulationAttentionBlock(nn.Module):
         x = x + y * e[2]
         return x, e
 
-<<<<<<< HEAD
     def ffn_only(self, x, e, dtype=torch.bfloat16):
         temp_x = self.norm2(x) * (1 + e[4]) + e[3]
         temp_x = temp_x.to(dtype)
         y = self.ffn(temp_x)
         x = x + y * e[5]
         return x
-=======
-        # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            # cross-attention
-            x = x + self.cross_attn(self.norm3(x).to(x.dtype), context, context_lens, dtype, t=t)
-
-            # ffn function
-            temp_x = self.norm2(x) * (1 + e[4]) + e[3]
-            temp_x = temp_x.to(dtype)
-            
-            y = self.ffn(temp_x)
-            x = x + y * e[5]
-            return x
->>>>>>> 54bf97ab661290a55d4ae91da3c0239a95eb6445
 
     def forward(self, x, e, seq_lens, freqs, dtype=torch.bfloat16, t=0):
         x, e = self.self_attention(x, e, seq_lens, freqs, dtype=dtype, t=t)
@@ -668,9 +653,7 @@ class Head(nn.Module):
         else:
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
         
-        x = self.head(
-            (self.norm(x) * (1 + e[1]) + e[0]).to(x.dtype)
-        )
+        x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x
 
 
@@ -1812,46 +1795,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         nn.init.zeros_(self.head.head.weight)
         if self.simulation_head is not None:
             nn.init.zeros_(self.simulation_head.head.weight)
-
-    @staticmethod
-    def _convert_from_wan_model_config(config: dict) -> dict:
-        """
-        Convert WanModel config to WanTransformer3DModel config.
-        This enables loading WanModel checkpoints with WanTransformer3DModel.
-        """
-        new_config = config.copy()
-        
-        # Convert has_image_input -> model_type
-        if 'has_image_input' in new_config:
-            new_config['model_type'] = 'i2v' if new_config.pop('has_image_input') else 't2v'
-        
-        # Convert has_ref_conv -> add_ref_conv
-        if 'has_ref_conv' in new_config:
-            new_config['add_ref_conv'] = new_config.pop('has_ref_conv')
-        
-        # Set WanTransformer3DModel specific defaults
-        new_config.setdefault('cross_attn_type', 'cross_attn')
-        new_config.setdefault('qk_norm', True)
-        new_config.setdefault('cross_attn_norm', True)
-        new_config.setdefault('text_len', 512)
-        new_config.setdefault('window_size', (-1, -1))
-        
-        # Compatibility fields
-        if 'in_dim' in new_config:
-            new_config['in_channels'] = new_config['in_dim']
-        if 'dim' in new_config:
-            new_config['hidden_size'] = new_config['dim']
-        
-        # Remove WanModel-specific keys that WanTransformer3DModel doesn't use
-        keys_to_remove = [
-            'has_image_pos_emb', 'require_clip_embedding', 'require_vae_embedding',
-            'seperated_timestep', 'fuse_vae_embedding_in_latents', '_class_name',
-            '_diffusers_version', '_name_or_path'
-        ]
-        for key in keys_to_remove:
-            new_config.pop(key, None)
-        
-        return new_config
 
     @classmethod
     def from_pretrained(
