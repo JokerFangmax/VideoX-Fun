@@ -81,7 +81,7 @@ from videox_fun.pipeline import FantasyTalkingPipeline, WanFunPipeline
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.utils import (calculate_dimensions,
                                     get_image_to_video_latent,
-                                    save_videos_grid)
+                                    merge_video_audio, save_videos_grid)
 
 if is_wandb_available():
     import wandb
@@ -190,7 +190,7 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, audio_encod
                 sample = pipeline(
                     args.validation_prompts[i],
                     num_frames = video_length,
-                    negative_prompt = "bad detailed",
+                    negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
                     height      = height,
                     width       = width,
                     generator   = generator,
@@ -201,16 +201,24 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, audio_encod
                     mask_video  = input_video_mask,
                     clip_image  = clip_image,
                     audio_path  = audio_path,
-                    shift       = 5,
-                    fps         = 16
+                    shift       = 3,
+                    fps         = 23
                 ).videos
                 os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
                 save_videos_grid(
                     sample, 
                     os.path.join(
                         args.output_dir, 
-                        f"sample/sample-{global_step}-rank{accelerator.process_index}-image-{i}.gif"
-                    )
+                        f"sample/sample-{global_step}-rank{accelerator.process_index}-image-{i}.mp4"
+                    ),
+                    fps=23
+                )
+                merge_video_audio(
+                    video_path=os.path.join(
+                        args.output_dir, 
+                        f"sample/sample-{global_step}-rank{accelerator.process_index}-image-{i}.mp4"
+                    ), 
+                    audio_path=args.validation_audio_paths[i]
                 )
 
             del pipeline
@@ -242,6 +250,12 @@ def parse_args():
         default=None,
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--pretrained_audio_model_name_or_path",
+        type=str,
+        default=None,
+        help=("Path to audio encoder model. If None, will use os.path.join(model_name, 'audio_encoder')."),
     )
     parser.add_argument(
         "--revision",
@@ -833,14 +847,16 @@ def main():
         )
         clip_image_encoder = clip_image_encoder.eval()
         
-        audio_encoder = FantasyTalkingAudioEncoder(
-            os.path.join(args.pretrained_model_name_or_path, "audio_encoder")
-        )
+        audio_encoder_path = args.pretrained_audio_model_name_or_path \
+            if args.pretrained_audio_model_name_or_path is not None and str(args.pretrained_audio_model_name_or_path) != "None" \
+            else os.path.join(args.pretrained_model_name_or_path, "audio_encoder")
+        audio_encoder = FantasyTalkingAudioEncoder(audio_encoder_path)
             
     # Get Transformer
     transformer3d = FantasyTalkingTransformer3DModel.from_pretrained(
         os.path.join(args.pretrained_model_name_or_path, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
         transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
+        low_cpu_mem_usage=True,
     ).to(weight_dtype)
 
     # Freeze vae and text_encoder and set transformer3d to trainable
@@ -1584,6 +1600,7 @@ def main():
                     torch.cuda.empty_cache()
                     vae.to(accelerator.device)
                     clip_image_encoder.to(accelerator.device)
+                    audio_encoder.to(accelerator.device)
                     if not args.enable_text_encoder_in_dataloader:
                         text_encoder.to("cpu")
 
@@ -1638,6 +1655,14 @@ def main():
                         clip_context.append(_clip_context if not zero_init_clip_in else torch.zeros_like(_clip_context))
                         
                     clip_context = torch.cat(clip_context)
+
+                with torch.no_grad():
+                    # Extract audio emb
+                    audio_wav2vec_fea = []
+                    for index in range(len(audio)):
+                        _audio_wav2vec_fea = audio_encoder.extract_audio_feat_without_file_load(audio[index], sample_rate[index])
+                        audio_wav2vec_fea.append(_audio_wav2vec_fea)
+                    audio_wav2vec_fea = torch.cat(audio_wav2vec_fea).to(weight_dtype)
                                                 
                 # wait for latents = vae.encode(pixel_values) to complete
                 if vae_stream_1 is not None:
@@ -1646,12 +1671,17 @@ def main():
                 if args.low_vram:
                     vae.to('cpu')
                     clip_image_encoder.to('cpu')
+                    audio_encoder.to("cpu")
                     torch.cuda.empty_cache()
                     if not args.enable_text_encoder_in_dataloader:
                         text_encoder.to(accelerator.device)
 
                 if args.enable_text_encoder_in_dataloader:
-                    prompt_embeds = batch['encoder_hidden_states'].to(device=latents.device)
+                    # Convert padded tensor to list of tensors with varying lengths
+                    encoder_hidden_states = batch['encoder_hidden_states'].to(device=latents.device)
+                    encoder_attention_mask = batch['encoder_attention_mask']
+                    seq_lens = encoder_attention_mask.gt(0).sum(dim=1).long()
+                    prompt_embeds = [u[:v] for u, v in zip(encoder_hidden_states, seq_lens)]
                 else:
                     with torch.no_grad():
                         prompt_ids = tokenizer(
@@ -1668,14 +1698,6 @@ def main():
                         seq_lens = prompt_attention_mask.gt(0).sum(dim=1).long()
                         prompt_embeds = text_encoder(text_input_ids.to(latents.device), attention_mask=prompt_attention_mask.to(latents.device))[0]
                         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
-
-                with torch.no_grad():
-                    # Extract audio emb
-                    audio_wav2vec_fea = []
-                    for index in range(len(audio)):
-                        _audio_wav2vec_fea = audio_encoder.extract_audio_feat_without_file_load(audio[index], sample_rate[index])
-                        audio_wav2vec_fea.append(_audio_wav2vec_fea)
-                    audio_wav2vec_fea = torch.cat(audio_wav2vec_fea).to(weight_dtype)
 
                 if args.low_vram and not args.enable_text_encoder_in_dataloader:
                     text_encoder.to('cpu')
@@ -1720,18 +1742,18 @@ def main():
                 # Add noise
                 target = noise - latents
                 
-                target_shape = (vae.latent_channels, num_frames, width, height)
+                # Calculate sequence length for transformer
+                # Note: num_frames, width, height are already in latent space dimensions
+                latent_shape = (vae.latent_channels, num_frames, width, height)
                 seq_len = math.ceil(
-                    (target_shape[2] * target_shape[3]) /
+                    (latent_shape[2] * latent_shape[3]) /
                     (accelerator.unwrap_model(transformer3d).config.patch_size[1] * accelerator.unwrap_model(transformer3d).config.patch_size[2]) *
-                    target_shape[1]
+                    latent_shape[1]
                 )
 
                 # Predict the noise residual
-                if rng is None:
-                    audio_scale = np.random.choice([1, 0], p=[0.9, 0.1])
-                else:
-                    audio_scale = rng.choice([1, 0], p=[0.9, 0.1])
+                # audio_scale is fixed to 1.0 for training
+                audio_scale = torch.tensor([1.0]).to(latents.device, latents.dtype)
                 with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=accelerator.device):
                     noise_pred = transformer3d(
                         x=noisy_latents,

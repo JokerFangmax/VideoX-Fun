@@ -22,7 +22,7 @@ from torchvision import transforms
 from transformers import T5Tokenizer
 
 from ..models import (AutoencoderKLWan, AutoTokenizer, CLIPModel,
-                      Wan2_2Transformer3DModel_S2V, WanAudioEncoder,
+                      FantasyTalkingTransformer3DModel, FantasyTalkingAudioEncoder,
                       WanT5EncoderModel)
 from ..utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                 get_sampling_sigmas)
@@ -159,8 +159,9 @@ class FantasyTalkingPipeline(DiffusionPipeline):
     library implements for all the pipelines (such as downloading or saving, running on a particular device, etc.)
     """
 
-    _optional_components = ["transformer_2", "audio_encoder"]
-    model_cpu_offload_seq = "text_encoder->transformer_2->transformer->vae"
+    _optional_components = ["audio_encoder"]
+    _exclude_from_cpu_offload = ["audio_encoder"]
+    model_cpu_offload_seq = "text_encoder->clip_image_encoder->transformer->vae"
 
     _callback_tensor_inputs = [
         "latents",
@@ -172,18 +173,17 @@ class FantasyTalkingPipeline(DiffusionPipeline):
         self,
         tokenizer: AutoTokenizer,
         text_encoder: WanT5EncoderModel,
-        audio_encoder: WanAudioEncoder,
+        audio_encoder: FantasyTalkingAudioEncoder,
         vae: AutoencoderKLWan,
-        transformer: Wan2_2Transformer3DModel_S2V,
+        transformer: FantasyTalkingTransformer3DModel,
         clip_image_encoder: CLIPModel,
-        transformer_2: Wan2_2Transformer3DModel_S2V = None,
         scheduler: FlowMatchEulerDiscreteScheduler = None,
     ):
         super().__init__()
 
         self.register_modules(
             tokenizer=tokenizer, text_encoder=text_encoder, vae=vae, transformer=transformer, 
-            transformer_2=transformer_2, scheduler=scheduler, clip_image_encoder=clip_image_encoder, audio_encoder=audio_encoder
+            clip_image_encoder=clip_image_encoder, audio_encoder=audio_encoder, scheduler=scheduler, 
         )
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae.spatial_compression_ratio)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae.spatial_compression_ratio)
@@ -315,6 +315,11 @@ class FantasyTalkingPipeline(DiffusionPipeline):
             )
 
         return prompt_embeds, negative_prompt_embeds
+
+    def encode_audio_embeddings(self, audio_path, num_frames, fps, weight_dtype, device):
+        audio_wav2vec_fea = self.audio_encoder.extract_audio_feat(audio_path, num_frames=num_frames, fps=fps)
+        audio_wav2vec_fea = audio_wav2vec_fea.to(device, weight_dtype)
+        return audio_wav2vec_fea
 
     def prepare_latents(
         self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator, latents=None, num_length_latents=None
@@ -486,14 +491,15 @@ class FantasyTalkingPipeline(DiffusionPipeline):
         num_inference_steps: int = 50,
         timesteps: Optional[List[int]] = None,
         guidance_scale: float = 6,
+        audio_guide_scale: float = 4.0,
         num_videos_per_prompt: int = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
-        output_type: str = "numpy",
-        return_dict: bool = False,
+        output_type: str = "pil",
+        return_dict: bool = True,
         callback_on_step_end: Optional[
             Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
         ] = None,
@@ -655,7 +661,9 @@ class FantasyTalkingPipeline(DiffusionPipeline):
             clip_context = torch.zeros_like(clip_context)
 
         # Extract audio emb
-        audio_wav2vec_fea = self.audio_encoder.extract_audio_feat(audio_path, num_frames=num_frames, fps=fps)
+        audio_wav2vec_fea = self.encode_audio_embeddings(
+            audio_path, num_frames=num_frames, fps=fps, weight_dtype=weight_dtype, device=device
+        )
 
         if comfyui_progressbar:
             pbar.update(1)
@@ -675,49 +683,97 @@ class FantasyTalkingPipeline(DiffusionPipeline):
                 if self.interrupt:
                     continue
 
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = latents
                 if hasattr(self.scheduler, "scale_model_input"):
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 if init_video is not None:
-                    mask_input = torch.cat([mask_latents] * 2) if do_classifier_free_guidance else mask_latents
-                    masked_video_latents_input = (
-                        torch.cat([masked_video_latents] * 2) if do_classifier_free_guidance else masked_video_latents
-                    )
+                    mask_input = mask_latents
+                    masked_video_latents_input = masked_video_latents
                     y = torch.cat([mask_input, masked_video_latents_input], dim=1).to(device, weight_dtype) 
 
-                clip_context_input = (
-                    torch.cat([clip_context] * 2) if do_classifier_free_guidance else clip_context
-                )
-
-                audio_wav2vec_fea_input = (
-                    torch.cat([audio_wav2vec_fea] * 2) if do_classifier_free_guidance else audio_wav2vec_fea
-                )
-
-                audio_scale = torch.tensor(
-                    [0.75, 1]
-                ).to(latent_model_input.device, latent_model_input.dtype)
+                # Use clip_context and audio_wav2vec_fea directly (no need to duplicate for CFG)
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latent_model_input.shape[0])
+                timestep = t.expand(latents.shape[0])
                 
-                # predict noise model_output
+                # predict noise model_output with audio CFG (similar to InfiniteTalk)
                 with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=device):
-                    noise_pred = self.transformer(
-                        x=latent_model_input,
-                        context=in_prompt_embeds,
-                        t=timestep,
-                        seq_len=seq_len,
-                        y=y,
-                        audio_wav2vec_fea=audio_wav2vec_fea_input,
-                        audio_scale=audio_scale,
-                        clip_fea=clip_context_input,
-                    )
-
-                # perform guidance
-                if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    if math.isclose(guidance_scale, 1.0):
+                        # Only audio guidance (no text CFG)
+                        # Forward with audio
+                        noise_pred_with_audio = self.transformer(
+                            x=latents,
+                            context=prompt_embeds,
+                            t=timestep,
+                            seq_len=seq_len,
+                            y=y,
+                            audio_wav2vec_fea=audio_wav2vec_fea,
+                            audio_scale=1.0,
+                            clip_fea=clip_context,
+                            cond_flag=True,
+                        )
+                        
+                        # Forward without audio
+                        noise_pred_no_audio = self.transformer(
+                            x=latents,
+                            context=prompt_embeds,
+                            t=timestep,
+                            seq_len=seq_len,
+                            y=y,
+                            audio_wav2vec_fea=audio_wav2vec_fea,  # zero audio
+                            audio_scale=0.0,
+                            clip_fea=clip_context,
+                            cond_flag=False,
+                        )
+                        
+                        # Apply audio guidance
+                        noise_pred = noise_pred_no_audio + audio_guide_scale * (noise_pred_with_audio - noise_pred_no_audio)
+                    else:
+                        # Full CFG with both text and audio guidance
+                        # Forward with text + audio (conditional)
+                        noise_pred_cond = self.transformer(
+                            x=latents,
+                            context=prompt_embeds,
+                            t=timestep,
+                            seq_len=seq_len,
+                            y=y,
+                            audio_wav2vec_fea=audio_wav2vec_fea,
+                            audio_scale=1.0,
+                            clip_fea=clip_context,
+                            cond_flag=True,
+                        )
+                        
+                        # Forward with negative text + audio
+                        noise_pred_drop_text = self.transformer(
+                            x=latents,
+                            context=negative_prompt_embeds,
+                            t=timestep,
+                            seq_len=seq_len,
+                            y=y,
+                            audio_wav2vec_fea=audio_wav2vec_fea,
+                            audio_scale=1.0,
+                            clip_fea=clip_context,
+                            cond_flag=False,
+                        )
+                        
+                        # Forward with negative text + no audio (unconditional)
+                        noise_pred_uncond = self.transformer(
+                            x=latents,
+                            context=negative_prompt_embeds,
+                            t=timestep,
+                            seq_len=seq_len,
+                            y=y,
+                            audio_wav2vec_fea=audio_wav2vec_fea,  # zero audio
+                            audio_scale=0.0,
+                            clip_fea=clip_context,
+                            cond_flag=False,
+                        )
+                        
+                        # Apply both text and audio guidance
+                        # noise_pred = uncond + guidance_scale * (cond - drop_text) + audio_guide_scale * (drop_text - uncond)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_drop_text) + \
+                                    audio_guide_scale * (noise_pred_drop_text - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
@@ -737,11 +793,9 @@ class FantasyTalkingPipeline(DiffusionPipeline):
                 if comfyui_progressbar:
                     pbar.update(1)
 
-        if output_type == "numpy":
+        if output_type == "pil":
             video = self.decode_latents(latents)
-        elif not output_type == "latent":
-            video = self.decode_latents(latents)
-            video = self.video_processor.postprocess_video(video=video, output_type=output_type)
+            video = torch.from_numpy(video)
         else:
             video = latents
 
@@ -749,6 +803,6 @@ class FantasyTalkingPipeline(DiffusionPipeline):
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            video = torch.from_numpy(video)
+            return video
 
         return WanPipelineOutput(videos=video)

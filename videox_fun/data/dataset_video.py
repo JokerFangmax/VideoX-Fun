@@ -214,9 +214,12 @@ class VideoSpeechDataset(Dataset):
         self,
         ann_path, data_root=None,
         video_sample_size=512, video_sample_stride=4, video_sample_n_frames=16,
-        enable_bucket=False, enable_inpaint=False,
+        enable_bucket=False, 
+        enable_inpaint=False,
         audio_sr=16000,  # New: target audio sample rate
-        text_drop_ratio=0.1  # New: text drop probability
+        text_drop_ratio=0.1,  # New: text drop probability
+        enable_motion_info=False,
+        motion_frames=73,
     ):
         print(f"loading annotations from {ann_path} ...")
         self.dataset = json.load(open(ann_path, 'r'))
@@ -230,6 +233,8 @@ class VideoSpeechDataset(Dataset):
         self.enable_inpaint = enable_inpaint
         self.audio_sr = audio_sr
         self.text_drop_ratio = text_drop_ratio
+        self.enable_motion_info = enable_motion_info
+        self.motion_frames = motion_frames
         
         video_sample_size = tuple(video_sample_size) if not isinstance(video_sample_size, int) else (video_sample_size, video_sample_size)
         self.pixel_transforms = transforms.Compose(
@@ -239,6 +244,8 @@ class VideoSpeechDataset(Dataset):
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
             ]
         )
+
+        self.video_sample_size = video_sample_size
     
     def get_batch(self, idx):
         video_dict = self.dataset[idx]
@@ -262,16 +269,23 @@ class VideoSpeechDataset(Dataset):
             total_frames = len(video_reader)
             fps = video_reader.get_avg_fps()  # Get the original video frame rate
 
+            # Avoid fps > 30
+            local_video_sample_stride = self.video_sample_stride
+            new_fps = int(fps // local_video_sample_stride)
+            while new_fps > 30:
+                local_video_sample_stride = local_video_sample_stride + 1
+                new_fps = int(fps // local_video_sample_stride)
+
             # Calculate the actual number of sampled video frames (considering boundaries)
-            max_possible_frames = (total_frames - 1) // self.video_sample_stride + 1
+            max_possible_frames = (total_frames - 1) // local_video_sample_stride + 1
             actual_n_frames = min(self.video_sample_n_frames, max_possible_frames)
             if actual_n_frames <= 0:
                 raise ValueError(f"Video too short: {video_path}")
 
             # Randomly select the starting frame
-            max_start = total_frames - (actual_n_frames - 1) * self.video_sample_stride - 1
+            max_start = total_frames - (actual_n_frames - 1) * local_video_sample_stride - 1
             start_frame = random.randint(0, max_start) if max_start > 0 else 0
-            frame_indices = [start_frame + i * self.video_sample_stride for i in range(actual_n_frames)]
+            frame_indices = [start_frame + i * local_video_sample_stride for i in range(actual_n_frames)]
 
             # Read video frames
             try:
@@ -284,41 +298,63 @@ class VideoSpeechDataset(Dataset):
             except Exception as e:
                 raise ValueError(f"Failed to extract frames from video. Error is {e}.")
 
+            # Motion Video Process
+            _, height, width, channel = np.shape(pixel_values)
+            if self.enable_motion_info:
+                motion_pixel_values = np.ones([self.motion_frames, height, width, channel]) * 127.5
+                if start_frame > 0:
+                    motion_max_possible_frames = (start_frame - 1) // local_video_sample_stride + 1
+                    motion_frame_indices = [0 + i * local_video_sample_stride for i in range(motion_max_possible_frames)]
+                    motion_frame_indices = motion_frame_indices[-self.motion_frames:]
+
+                    _motion_sample_args = (video_reader, motion_frame_indices)
+                    _motion_pixel_values = func_timeout(
+                        VIDEO_READER_TIMEOUT, get_video_reader_batch, args=_motion_sample_args
+                    )
+                    motion_pixel_values[-len(motion_frame_indices):] = _motion_pixel_values
+
+                if not self.enable_bucket:
+                    motion_pixel_values = torch.from_numpy(motion_pixel_values).permute(0, 3, 1, 2).contiguous()
+                    motion_pixel_values = motion_pixel_values / 255.
+                    motion_pixel_values = self.pixel_transforms(motion_pixel_values)
+            else:
+                motion_pixel_values = None
+
             # Video post-processing
             if not self.enable_bucket:
                 pixel_values = torch.from_numpy(pixel_values).permute(0, 3, 1, 2).contiguous()
                 pixel_values = pixel_values / 255.
                 pixel_values = self.pixel_transforms(pixel_values)
 
-            # === New: Load and extract the corresponding audio segment ===
-            # Start and end times (in seconds) of the video clip
-            start_time = start_frame / fps
-            end_time = (start_frame + (actual_n_frames - 1) * self.video_sample_stride) / fps
-            duration = end_time - start_time
+        # === New: Load and extract the corresponding audio segment ===
+        # Start and end times (in seconds) of the video clip
+        start_time = start_frame / fps
+        end_time = (start_frame + (actual_n_frames - 1) * self.video_sample_stride) / fps
+        duration = end_time - start_time
 
-            # Use librosa to load the entire audio (librosa.load does not support precise seeking, so load first then slice)
-            audio_input, sample_rate = librosa.load(audio_path, sr=self.audio_sr)  # Resample to target sr
+        # Use librosa to load the entire audio (librosa.load does not support precise seeking, so load first then slice)
+        audio_input, sample_rate = librosa.load(audio_path, sr=self.audio_sr)  # Resample to target sr
 
-            # Convert to sample indices
-            start_sample = int(start_time * self.audio_sr)
-            end_sample = int(end_time * self.audio_sr)
+        # Convert to sample indices (calculate end from start + duration to avoid float precision issues)
+        start_sample = round(start_time * self.audio_sr)
+        target_len = round(duration * self.audio_sr)
+        end_sample = start_sample + target_len
 
-            # Safe slicing
-            if start_sample >= len(audio_input):
-                # Audio is too short, pad with zeros or truncate
-                audio_segment = np.zeros(int(duration * self.audio_sr), dtype=np.float32)
-            else:
-                audio_segment = audio_input[start_sample:end_sample]
-                # If too short, pad with zeros
-                target_len = int(duration * self.audio_sr)
-                if len(audio_segment) < target_len:
-                    audio_segment = np.pad(audio_segment, (0, target_len - len(audio_segment)), mode='constant')
+        # Safe slicing
+        if start_sample >= len(audio_input):
+            # Audio is too short, pad with zeros or truncate
+            raise ValueError(f"Audio file too short: {audio_path}")
+        else:
+            audio_segment = audio_input[start_sample:end_sample]
+            # If too short, pad with zeros
+            if len(audio_segment) < target_len:
+                raise ValueError(f"Audio file too short: {audio_path}")
 
-            # === Random text dropping ===
-            if random.random() < self.text_drop_ratio:
-                text = ''
+        # === Random text dropping ===
+        if random.random() < self.text_drop_ratio:
+            text = ''
 
-            return pixel_values, text, audio_segment, sample_rate
+        return pixel_values, motion_pixel_values, text, audio_segment, sample_rate, new_fps
 
     def __len__(self):
         return self.length
@@ -327,11 +363,13 @@ class VideoSpeechDataset(Dataset):
         while True:
             sample = {}
             try:
-                pixel_values, text, audio, sample_rate = self.get_batch(idx)
+                pixel_values, motion_pixel_values, text, audio, sample_rate, fps = self.get_batch(idx)
                 sample["pixel_values"] = pixel_values
+                sample["motion_pixel_values"] = motion_pixel_values
                 sample["text"] = text
                 sample["audio"] = torch.from_numpy(audio).float()  # Convert to tensor
                 sample["sample_rate"] = sample_rate
+                sample["fps"] = fps
                 sample["idx"] = idx
                 break
             except Exception as e:
@@ -356,7 +394,8 @@ class VideoSpeechControlDataset(Dataset):
         self,
         ann_path, data_root=None,
         video_sample_size=512, video_sample_stride=4, video_sample_n_frames=16,
-        enable_bucket=False, enable_inpaint=False,
+        enable_bucket=False, 
+        enable_inpaint=False,
         audio_sr=16000,
         text_drop_ratio=0.1,
         enable_motion_info=False,
@@ -415,24 +454,29 @@ class VideoSpeechControlDataset(Dataset):
         # Video information
         with VideoReader_contextmanager(video_path, num_threads=2) as video_reader:
             total_frames = len(video_reader)
-            fps = video_reader.get_avg_fps()
+            fps = video_reader.get_avg_fps()  # Get the original video frame rate
             if fps <= 0:
                 raise ValueError(f"Video has negative fps: {video_path}")
+            
+            # Avoid fps > 30
             local_video_sample_stride = self.video_sample_stride
             new_fps = int(fps // local_video_sample_stride)
             while new_fps > 30:
                 local_video_sample_stride = local_video_sample_stride + 1
                 new_fps = int(fps // local_video_sample_stride)
 
+            # Calculate the actual number of sampled video frames (considering boundaries)
             max_possible_frames = (total_frames - 1) // local_video_sample_stride + 1
             actual_n_frames = min(self.video_sample_n_frames, max_possible_frames)
             if actual_n_frames <= 0:
                 raise ValueError(f"Video too short: {video_path}")
 
+            # Randomly select the starting frame
             max_start = total_frames - (actual_n_frames - 1) * local_video_sample_stride - 1
             start_frame = random.randint(0, max_start) if max_start > 0 else 0
             frame_indices = [start_frame + i * local_video_sample_stride for i in range(actual_n_frames)]
 
+            # Read video frames
             try:
                 sample_args = (video_reader, frame_indices)
                 pixel_values = func_timeout(
@@ -443,6 +487,7 @@ class VideoSpeechControlDataset(Dataset):
             except Exception as e:
                 raise ValueError(f"Failed to extract frames from video. Error is {e}.")
 
+            # Motion Video Process for Wan-S2V
             _, height, width, channel = np.shape(pixel_values)
             if self.enable_motion_info:
                 motion_pixel_values = np.ones([self.motion_frames, height, width, channel]) * 127.5
@@ -464,27 +509,11 @@ class VideoSpeechControlDataset(Dataset):
             else:
                 motion_pixel_values = None
 
+            # Video post-processing
             if not self.enable_bucket:
                 pixel_values = torch.from_numpy(pixel_values).permute(0, 3, 1, 2).contiguous()
                 pixel_values = pixel_values / 255.
                 pixel_values = self.pixel_transforms(pixel_values)
-
-        # Audio information
-        start_time = start_frame / fps
-        end_time = (start_frame + (actual_n_frames - 1) * local_video_sample_stride) / fps
-        duration = end_time - start_time
-
-        audio_input, sample_rate = librosa.load(audio_path, sr=self.audio_sr)
-        start_sample = int(start_time * self.audio_sr)
-        end_sample = int(end_time * self.audio_sr)
-
-        if start_sample >= len(audio_input):
-            raise ValueError(f"Audio file too short: {audio_path}")
-        else:
-            audio_segment = audio_input[start_sample:end_sample]
-            target_len = int(duration * self.audio_sr)
-            if len(audio_segment) < target_len:
-                raise ValueError(f"Audio file too short: {audio_path}")
 
         # Control information
         with VideoReader_contextmanager(control_video_id, num_threads=2) as control_video_reader:
@@ -507,13 +536,34 @@ class VideoSpeechControlDataset(Dataset):
             if not self.enable_bucket:
                 control_pixel_values = torch.from_numpy(control_pixel_values).permute(0, 3, 1, 2).contiguous()
                 control_pixel_values = control_pixel_values / 255.
+                control_pixel_values = self.pixel_transforms(control_pixel_values)
                 del control_video_reader
-            else:
-                control_pixel_values = control_pixel_values
 
-            if not self.enable_bucket:
-                control_pixel_values = self.video_transforms(control_pixel_values)
+        # === New: Load and extract the corresponding audio segment ===
+        # Start and end times (in seconds) of the video clip
+        start_time = start_frame / fps
+        end_time = (start_frame + (actual_n_frames - 1) * local_video_sample_stride) / fps
+        duration = end_time - start_time
 
+        # Use librosa to load the entire audio (librosa.load does not support precise seeking, so load first then slice)
+        audio_input, sample_rate = librosa.load(audio_path, sr=self.audio_sr)  # Resample to target sr
+
+        # Convert to sample indices
+        start_sample = int(start_time * self.audio_sr)
+        end_sample = int(end_time * self.audio_sr)
+
+        # Safe slicing
+        if start_sample >= len(audio_input):
+            # Audio is too short, pad with zeros or truncate
+            raise ValueError(f"Audio file too short: {audio_path}")
+        else:
+            audio_segment = audio_input[start_sample:end_sample]
+            # If too short, pad with zeros
+            target_len = int(duration * self.audio_sr)
+            if len(audio_segment) < target_len:
+                raise ValueError(f"Audio file too short: {audio_path}")
+
+        # === Random text dropping ===
         if random.random() < self.text_drop_ratio:
             text = ''
 

@@ -1,9 +1,7 @@
-import math
 import os
 import sys
 from pathlib import Path
 
-import librosa
 import numpy as np
 import torch
 from audio_separator.separator import Separator
@@ -18,13 +16,15 @@ for project_root in project_roots:
 
 from videox_fun.dist import set_multi_gpus_devices, shard_model
 from videox_fun.models import (AutoencoderKLLongCatVideo, AutoTokenizer,
+                               LongCatVideoAudioEncoder,
                                LongCatVideoAvatarTransformer3DModel,
-                               UMT5EncoderModel, Wav2Vec2FeatureExtractor,
-                               Wav2Vec2ModelWrapper)
+                               UMT5EncoderModel)
 from videox_fun.models.cache_utils import get_teacache_coefficients
 from videox_fun.pipeline import LongCatVideoAvatarPipeline
 from videox_fun.utils.fm_solvers import FlowDPMSolverMultistepScheduler
 from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from videox_fun.utils import (register_auto_device_hook,
+                              safe_enable_group_offload)
 from videox_fun.utils.fp8_optimization import (convert_model_weight_to_float8,
                                                convert_weight_dtype_wrapper,
                                                replace_parameters_by_name)
@@ -42,6 +42,9 @@ from videox_fun.utils.utils import (filter_kwargs, get_image_to_video_latent,
 # 
 # model_cpu_offload_and_qfloat8 indicates that the entire model will be moved to the CPU after use, 
 # and the transformer model has been quantized to float8, which can save more GPU memory. 
+# 
+# model_group_offload transfers internal layer groups between CPU/CUDA, 
+# balancing memory efficiency and speed between full-module and leaf-level offloading methods.
 # 
 # sequential_cpu_offload means that each layer of the model will be moved to the CPU after use, 
 # resulting in slower speeds but saving a large amount of GPU memory.
@@ -136,15 +139,10 @@ text_encoder = UMT5EncoderModel.from_pretrained(
 )
 
 # Get Audio encoder (for avatar mode)
-audio_encoder = Wav2Vec2ModelWrapper(
+audio_encoder = LongCatVideoAudioEncoder(
     os.path.join(model_name_avatar, 'chinese-wav2vec2-base')
 )
-audio_encoder.feature_extractor._freeze_parameters()
-
-wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-    os.path.join(model_name_avatar, 'chinese-wav2vec2-base'), 
-    local_files_only=True
-)
+audio_encoder.audio_encoder.feature_extractor._freeze_parameters()
 
 # Get Scheduler
 Chosen_Scheduler = scheduler_dict = {
@@ -165,7 +163,6 @@ pipeline = LongCatVideoAvatarPipeline(
     text_encoder=text_encoder,
     scheduler=scheduler,
     audio_encoder=audio_encoder,
-    wav2vec_feature_extractor=wav2vec_feature_extractor,
 )
 
 if compile_dit:
@@ -175,8 +172,10 @@ if compile_dit:
 
 if GPU_memory_mode == "sequential_cpu_offload":
     replace_parameters_by_name(transformer, ["modulation",], device=device)
-    transformer.freqs = transformer.freqs.to(device=device)
     pipeline.enable_sequential_cpu_offload(device=device)
+elif GPU_memory_mode == "model_group_offload":
+    register_auto_device_hook(pipeline.transformer)
+    safe_enable_group_offload(pipeline, onload_device=device, offload_device="cpu", offload_type="leaf_level", use_stream=True)
 elif GPU_memory_mode == "model_cpu_offload_and_qfloat8":
     convert_model_weight_to_float8(transformer, exclude_module_name=["modulation",], device=device)
     convert_weight_dtype_wrapper(transformer, weight_dtype)

@@ -5,8 +5,10 @@ import warnings
 from diffusers import AutoencoderKL
 from transformers import (AutoProcessor, AutoTokenizer, CLIPImageProcessor,
                           CLIPTextModel, CLIPTokenizer,
-                          CLIPVisionModelWithProjection, LlamaModel,
-                          LlamaTokenizerFast, LlavaForConditionalGeneration,
+                          CLIPVisionModelWithProjection,
+                          Gemma3ForConditionalGeneration, GemmaTokenizer,
+                          GemmaTokenizerFast, LlamaModel, LlamaTokenizerFast,
+                          LlavaForConditionalGeneration,
                           Mistral3ForConditionalGeneration, PixtralProcessor,
                           Qwen3Config, Qwen3ForCausalLM, T5EncoderModel,
                           T5Tokenizer, T5TokenizerFast, UMT5EncoderModel,
@@ -21,6 +23,7 @@ except Exception:
     Qwen2VLProcessor, Qwen2_5_VLConfig = None, None
     print("Your transformers version is too old to load Qwen2_5_VLForConditionalGeneration and Qwen2Tokenizer. If you wish to use QwenImage, please upgrade your transformers package to the latest version.")
 
+<<<<<<< HEAD
 def _optional_import(module_name, *names):
     try:
         module = importlib.import_module(f".{module_name}", __name__)
@@ -67,6 +70,52 @@ _optional_import("turbowan_transformer3d", "TurboWanTransformer3DModel")
 _optional_import("wan_audio_encoder", "WanAudioEncoder")
 _optional_import("wan_image_encoder", "CLIPModel")
 _optional_import("wan_text_encoder", "WanT5EncoderModel")
+=======
+try:
+    from transformers import Qwen3VLForConditionalGeneration
+except:
+    Qwen3VLForConditionalGeneration = None
+    print("Your transformers version is too old to load Qwen3VLForConditionalGeneration. If you wish to use QwenImage, please upgrade your transformers package to the latest version.")
+
+from .cogvideox_transformer3d import CogVideoXTransformer3DModel
+from .cogvideox_vae import AutoencoderKLCogVideoX
+from .fantasytalking_audio_encoder import FantasyTalkingAudioEncoder
+from .fantasytalking_transformer3d import FantasyTalkingTransformer3DModel
+from .flashhead_transformer3d import FlashHeadTransformer3DModel
+from .flashhead_audio_encoder import FlashHeadAudioEncoder
+from .flux2_image_processor import Flux2ImageProcessor
+from .flux2_transformer2d import Flux2Transformer2DModel
+from .flux2_transformer2d_control import Flux2ControlTransformer2DModel
+from .flux2_vae import AutoencoderKLFlux2
+from .flux_transformer2d import FluxTransformer2DModel
+from .hunyuanvideo_transformer3d import HunyuanVideoTransformer3DModel
+from .hunyuanvideo_vae import AutoencoderKLHunyuanVideo
+from .infinitetalk_audio_encoder import InfiniteTalkAudioEncoder
+from .infinitetalk_transformer3d import InfiniteTalkTransformer3DModel
+from .longcatvideo_audio_encoder import (LongCatVideoAudioEncoder,
+                                         Wav2Vec2ModelWrapper)
+from .longcatvideo_transformer3d import LongCatVideoTransformer3DModel
+from .longcatvideo_transformer3d_avatar import \
+    LongCatVideoAvatarTransformer3DModel
+from .longcatvideo_vae import AutoencoderKLLongCatVideo
+from .ltx2_connecter import LTX2TextConnectors
+from .ltx2_transformer3d import LTX2VideoTransformer3DModel
+from .ltx2_vae import AutoencoderKLLTX2Video
+from .ltx2_vae_audio import AutoencoderKLLTX2Audio
+from .ltx2_vocoder import LTX2Vocoder
+from .mova_audio_transformer3d import WanAudioTransformer3DModel
+from .mova_interactionv2 import MOVADualTowerConditionalBridge
+from .mova_model import MOVAModel
+from .mova_vae_audio import AutoencoderKLMOVAAudio
+from .qwenimage_transformer2d import QwenImageTransformer2DModel
+from .qwenimage_transformer2d_control import QwenImageControlTransformer2DModel
+from .qwenimage_transformer2d_instantx import QwenImageInstantXControlNetModel
+from .qwenimage_vae import AutoencoderKLQwenImage
+from .turbowan_transformer3d import TurboWanTransformer3DModel
+from .wan_audio_encoder import WanAudioEncoder
+from .wan_image_encoder import CLIPModel
+from .wan_text_encoder import WanT5EncoderModel
+>>>>>>> 54bf97ab661290a55d4ae91da3c0239a95eb6445
 from .wan_transformer3d import (Wan2_2Transformer3DModel, WanRMSNorm,
                                 WanSelfAttention, WanTransformer3DModel)
 _optional_import("wan_transformer3d_animate", "Wan2_2Transformer3DModel_Animate")
